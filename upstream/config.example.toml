@@ -1,0 +1,113 @@
+# Copy to config.toml (git-ignored). Empty credentials are intentional.
+# The application never sends these values to the frontend.
+[bot]
+owner = 0
+token = ""
+# Optional local Telegram Bot API; requires matching shared file storage.
+# api_url = "http://telegram-bot-api:8081"
+# Optional Telegram app credentials from my.telegram.org. With both set,
+# MHub also signs in as this bot over MTProto and streams cached songs by byte
+# range instead of waiting for the Bot API to fetch the whole file. The
+# session keys are kept in data/telegram-mtproto-session.json (keep private).
+# api_id = 0
+# api_hash = ""
+
+[db.mysql]
+# Optional existing music_cache database. Do not publish this URL.
+url = ""
+
+[music]
+inline_upload_chat_id = 0
+# Optional upload bot: a second bot whose Telegram data centre is near the
+# server posts songs into this private channel (both bots admins), and the
+# main bot forwards each post to get its own file id. Much faster uploads
+# when the main bot's data centre is far away. 0 uploads directly.
+upload_channel_id = 0
+# upload_bot_token_file = "/etc/music-gateway/uploader-token"
+
+[music.applemusic]
+enabled = true
+media_user_token = ""
+storefront = "us"
+language = "en-US"
+timeout = 30
+# External, separately authenticated wrapper services; not bundled in this image.
+wrapper_host = ""
+wrapper_hosts = []
+wrapper_lite_enabled = false
+wrapper_lite_url = ""
+wrapper_lite_urls = []
+wrapper_lite_batch_size = 256
+wrapper_track_concurrency = 1
+wrapper_fragment_concurrency = 2
+wrapper_connection_concurrency = 2
+# Optional path to your own device file, mounted read-only. No device is bundled.
+wv_device = ""
+wv_client_id = ""
+wv_private_key = ""
+
+[music.netease]
+cookie = ""
+# Hours between login refreshes (0 = off). A refreshed Cookie is stored in the
+# private data directory and is ignored once the cookie above changes.
+refresh_hours = 0
+
+[music.tencent]
+cookie = ""
+
+[music.soda]
+cookie = ""
+
+[music.vkeys]
+enabled = true
+base_url = "https://api.vkeys.cn"
+token = ""
+
+[gateway]
+# Loopback API lending these music accounts, downloads and the Telegram cache
+# to local services such as the Telegram bot, so their accounts are configured
+# only here. Empty listen disables it; keep it on a loopback address.
+listen = ""
+# listen = "127.0.0.1:8091"
+# At least 32 characters, shared with the clients. Prefer a 0600 file.
+token_file = ""
+# token = ""
+
+[auth]
+# Accounts and cross-device playlist/queue sync (needs db.mysql.url).
+# Leave rp_origin empty to disable. Passkeys are bound to this origin.
+rp_origin = ""
+# rp_id = ""             # defaults to the origin's host
+# Cloudflare Turnstile for sign-up; empty keys disable the challenge.
+turnstile_site_key = ""
+turnstile_secret = ""
+# session_days = 30
+# cookie_secure = true   # set false only for plain-HTTP local testing
+
+[audio_cache]
+# Local copies of finished songs (data/downloads). Telegram and the platforms
+# keep the real copy; a song's local files are removed after this many idle
+# hours, and the oldest go first once the directory passes max_gib.
+idle_hours = 72
+max_gib = 20
+
+[upstream_limit]
+# Per-client quotas on work that reaches a music platform: new downloads,
+# searches the search cache cannot answer, lyrics and catalog metadata.
+# Cached songs, status polls, audio and covers are free. Every client address
+# (IPv6 by /64) has its own buckets; nothing is shared between clients.
+# shadow logs what enforce would do without waiting or refusing; off disables.
+mode = "enforce"
+# Peers whose X-Real-IP names the client. The proxy must overwrite that header
+# with the address it verified.
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+# A shortfall that refills within this time waits instead of answering 429.
+max_wait_ms = 3000
+# burst = bucket size, per_minute = refill rate; per_minute = 0 disables a kind.
+# Bursts cover an ordinary listener's busiest ten minutes; refill rates stay
+# under a client that keeps going around the clock.
+download = { burst = 20, per_minute = 1 }
+search = { burst = 20, per_minute = 2 }
+import = { burst = 150, per_minute = 30 }
+lyrics = { burst = 25, per_minute = 2 }
+metadata = { burst = 20, per_minute = 3 }

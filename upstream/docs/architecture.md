@@ -1,0 +1,64 @@
+# 架构
+
+```text
+Vue / Pinia
+  ├─ 搜索、推荐、歌单和播放队列
+  ├─ IndexedDB 音频与歌词缓存
+  └─ 播放器
+       ├─ 浏览器原生音频
+       └─ WASM ALAC 解码 → 按帧排程的 AudioBuffer 播放
+                    │
+              Rust / Axum
+       ┌────────────┼──────────────┐
+    平台适配      播放任务        缓存协调
+       │            │              │
+ 外部平台/wrapper   文件/包流    本地磁盘 / 可选 MySQL + Telegram
+```
+
+## 边界与数据流
+
+`src/api.rs` 提供界面所需的 HTTP 接口和播放任务状态，平台逻辑位于 `src/music/`。音频表示、响度分析、ALAC 包流和缓存分别在独立模块中维护。用户点击播放后先确定当前音质，再选择可复用缓存或准备平台音频；下载过程与界面播放状态独立推进。
+
+ALAC 解码器只把完整数据包解码为 PCM，不处理账号、网络或媒体授权。前端根据浏览器能力选择 WASM 或原生路径，使用流身份与版本校验避免拼接不同文件。原生兼容路径可能需要等待完整文件；不能保证所有浏览器冷缓存都立即出声。
+
+播放任务状态支持长轮询：`GET /api/v1/playbacks/:id?since=<已知状态>&wait_ms=<毫秒>` 会在任务离开该状态时立即返回（最长 15 秒），客户端不再以固定间隔轮询。前端构建时生成 `.br` / `.gz` 静态文件，由后端直接按 `Accept-Encoding` 提供；JSON 接口响应按需压缩，音频与 ALAC 包流不压缩。ALAC 解码器与 AMLL 歌词渲染均为按需加载的独立分块。
+
+浏览器本地缓存按歌曲、音质和音频表示区分，歌词原文跨音质复用；当前曲目完整缓存后才请求下一首。服务器维护本地文件与任务，并可复用已有 Telegram 缓存记录；持久化状态放在数据目录，凭据通过独立配置读取。
+
+### 音源网关
+
+`crates/music-gateway` 是 MHub 与其他服务（目前是 Telegram bot）之间的契约：平台、音质、搜索结果、歌词、曲目元数据、媒体任务与错误码，以及 `client` 特性下的 HTTP 客户端。MHub 的平台枚举与搜索结果类型直接来自该 crate，两端编译期共享同一份定义，`PROTOCOL_VERSION` 不一致时网关拒绝请求。
+
+网关（`src/api/gateway.rs`）只监听 `[gateway] listen` 配置的回环地址，按 Bearer 令牌鉴权。媒体请求先用 `/v1/media/lookup` 判断是否已在 Telegram 缓存（不触发下载），需要下载时 `/v1/media` 复用网页的 `start_download`、inflight 去重与后台上传，`GET /v1/media/:id` 长轮询下载字节进度、上传阶段，直到返回 `file_id`；上传失败时从本地副本重试一次，副本已清理则让任务失败、下次请求重新下载。客户端发现 `file_id` 被 Telegram 拒绝时调用 `/v1/cache/invalidate`。MHub 因此是平台账号、下载和 `music_cache` 的唯一使用方与写入方，客户端只负责自己的用户限流和发送。
+
+## 可维护性
+
+- Rust 和 npm lockfile 固定依赖；Docker 重新构建解码器与前端。
+- 默认测试使用合成数据或本地 mock，真实账号下载显式 opt-in。
+- 公开源码、Docker 上下文和对应源码包共用发布边界检查。
+- API 运行能力保留；历史在线 API 文档、部署记录和私人数据不随源码发布。
+- 平台配置、音频缓存和播放任务仍由所有访问者共享；账号只隔离个人资料库与接力播放状态。
+
+## PWA 安装与更新
+
+安装清单的 `id`、`start_url`、`scope` 保持稳定；明暗主题清单共用身份。图标使用内容哈希 URL，安装元数据按发布版本更新并重新验证 HTTP 缓存，离线仍可使用缓存副本。Service Worker 更新绕过脚本 HTTP 缓存；更新不会强制刷新正在播放的页面，也不会清理音频缓存。
+
+`frontend/public/icons/app-icon.svg` 是安装图标的源文件。可选开发工具 `scripts/generate_pwa_icons.mjs` 使用 Sharp 生成 192／512 像素全彩 PNG、Apple Touch 图标和内嵌 PNG 的 favicon.ico，Sharp 不进入前端运行包。生成时设置 `SHARP_MODULE` 指向本地安装的 Sharp 模块入口；更换图标后提交生成资产并执行 `node scripts/verify_pwa_icons_browser.mjs`（可通过 `PLAYWRIGHT_MODULE` 指定 Playwright 模块）。
+
+部分 Android 浏览器将重新编码的图标写入快捷方式字符串，受系统 65,535 字节限制；下载 PNG 的体积无法预测此字符串大小。浏览器验证覆盖多种缩放尺寸和 PNG 再编码，发布验证还需检查真实设备的快捷方式能否持久化。图标采用低复杂度矢量源，避免噪点纹理放大重新编码体积。
+
+## 账号与跨设备同步
+
+`[auth]` 的 `rp_origin` 为空时账号功能关闭，`/api/v1/auth/config` 返回 `enabled: false`，前端不显示入口，也不加载同步代码。启用后需要 MySQL；账号相关表（`mhub_` 前缀）由服务启动后首次使用时 `CREATE TABLE IF NOT EXISTS` 创建。
+
+- **认证**（`src/accounts/`）：通行密钥（webauthn-rs，可发现凭据）为主，argon2 密码兜底，注册时生成 8 个一次性恢复码。会话令牌放在 `HttpOnly; SameSite=Lax` Cookie `mhub_session`，库中只存 SHA-256；30 天滑动续期，可在设备列表吊销。写操作要求 `x-mhub-client` 头，WebSocket 握手校验 Origin。注册可选 Cloudflare Turnstile；登录与注册按 IP 和用户名限流。
+- **资料库**：每个账号一份 Yjs 文档，包含歌单（含有序曲目键）、曲目元数据、喜欢／少推荐。曲目键为平台加源 ID，不含音质。服务端以 `yrs` 持有内存文档，更新追加写入 `mhub_library_updates`，每 200 条或 1 MB 压缩为快照；同一账号的连接通过广播互推。单次更新上限 2 MiB，单文档上限由 `library_limit_bytes` 配置。
+- **传输**：`/api/v1/sync/ws` 使用 y-sync 协议（step1/step2/update）；无法建立 WebSocket 时退回 `POST /api/v1/sync/library` 交换状态向量和差量。
+- **原生客户端**：没有 Yjs 引擎的 iOS/Android 用 `GET /api/v1/sync/library/json` 读取歌单快照（与网页 `readLibrary()` 同形），用 `POST` 同一路径提交 `create`/`append`/`rename`/`delete`/`remove`/`move`/`taste` 操作（语义同 `services/sync/library.js`，`move` 为原生拖动排序）。服务端在账号文档的临时副本上执行，生成的 Yjs 更新照常持久化并广播，网页副本实时合并；时间戳写成 float64，网页读出仍是普通数字。
+- **本地副本**：登录后的资料库保存在 IndexedDB（`mhub-library-<账号 ID>`），同步代码为懒加载分块。会话过期或断网时继续写入本地副本，重新登录同一账号后由 CRDT 自动合并，新增、改名、删除与重排都不会重复或丢失。
+- **登录合并**：同一账号的副本直接走 CRDT 同步；另一账号的副本保留在本机，切换到新账号；游客 localStorage 数据生成合并预览——规范化同名且曲目重合度不低于 60%、或来源链接相同的歌单合并，其余新建，喜欢／少推荐取并集。处理过的游客歌单打 `importedTo` 标记，不会重复询问。主动退出登录时可选择清除本机云端副本。
+- **接力播放**：播放队列不进入 CRDT。每台设备上报最近一份播放快照（队列窗口、位置、播放模式），服务端按设备后写覆盖并推送。其他设备在首页和队列页显示“在此设备继续”，用本机音质设置接管，不会打断本机播放。
+
+**导入歌单同步**（`frontend/src/services/playlist-sync.js`）：同平台导入（来源平台与播放平台相同）会保存原歌单链接、来源平台和导入时的来源曲目快照（`source_keys`）。同步时重新解析原歌单，按「上次快照、原歌单现状、本地歌单」三方合并：原歌单新增的歌插入到原歌单相邻歌曲之后，原歌单删除的歌在本地删除，用户在本地自行添加或删除的歌保持不变。打开应用时，超过 24 小时未同步的歌单会在后台逐个同步；歌单详情页和歌单右键菜单可随时手动同步。登录后同步以最小增删操作写入 Yjs 资料库，与其他设备的并发修改正常合并。跨平台导入依赖模糊匹配，不参与同步。
+
+`scripts/verify_account_sync_browser.mjs` 用两个浏览器上下文和虚拟认证器验证游客合并、通行密钥登录、实时同步、会话失效后的离线合并及接力播放；需要启用 `[auth]` 的后端和测试数据库。
