@@ -319,6 +319,11 @@ pub struct CollectionParams {
     pub url: String,
     /// Omit for complete import; an explicit limit requests a preview.
     pub limit: Option<usize>,
+    /// Import what the platform listed even when it listed fewer songs than
+    /// the collection claims (the user confirmed after an
+    /// `incomplete_collection` error).
+    #[serde(default)]
+    pub allow_incomplete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,7 +800,7 @@ async fn resolve_collection(
     let limit = collection_request_limit(params.limit)?;
     let collection = upstream_limit::metered(
         upstream_limit::Kind::Metadata,
-        music::collection(platform, source_url, limit),
+        music::collection(platform, source_url, limit, params.allow_incomplete),
     )
     .await?;
     if params.limit.is_none() && collection.items.len() > music::MAX_COLLECTION_ITEMS {
@@ -1058,6 +1063,7 @@ async fn lyrics(Query(params): Query<LyricsParams>) -> ApiResult<Json<LyricsResp
 
 /// `error_code` / response `code` for a song no source can play.
 const UNPLAYABLE_CODE: &str = "unplayable";
+const INCOMPLETE_COLLECTION_CODE: &str = "incomplete_collection";
 
 fn normalize_streaming_mode(mode: Option<String>) -> Option<String> {
     mode.and_then(|value| {
@@ -2376,7 +2382,44 @@ fn reuse_upload(mut cache: MusicCache, existing: &MusicCache) -> MusicCache {
     cache.music_size = existing.music_size;
     cache.lyrics_tag = existing.lyrics_tag;
     cache.from_chat_id = existing.from_chat_id;
+    // The upload may be a re-encode in another format (`telegram_audio`).
+    if !existing.file_ext.trim().is_empty() && existing.file_ext != cache.file_ext {
+        cache.file_ext = existing.file_ext.clone();
+        cache.bitrate = existing.bitrate;
+    }
     cache
+}
+
+/// Telegram keeps only MP3, M4A and FLAC as songs; anything else sent with
+/// sendAudio comes back as a voice message or a document, which the bot
+/// cannot send as a song. Re-encodes such a file to AAC M4A and points the
+/// job and its row at the new format. Returns whether it did.
+async fn telegram_audio(job: &mut TelegramCacheUpload) -> ApiResult<bool> {
+    if crate::lyric_tags::Container::sniff(&job.audio).is_some() {
+        return Ok(false);
+    }
+    let source_bps = u32::try_from(job.cache.bitrate).ok();
+    let kbps = crate::audio::aac_kbps_for(source_bps);
+    let started = std::time::Instant::now();
+    let m4a = crate::audio::transcode_to_m4a(&job.audio, kbps).await?;
+    tracing::info!(
+        platform = %job.cache.platform,
+        track_id = %job.cache.track_id,
+        from = %job.cache.file_ext,
+        kbps,
+        ms = started.elapsed().as_millis() as u64,
+        "re-encoded audio to M4A for the Telegram cache"
+    );
+    job.audio = m4a;
+    job.cache.file_ext = "m4a".to_string();
+    job.cache.bitrate = (kbps * 1000) as i32;
+    job.content_type = "audio/mp4".to_string();
+    let stem = job
+        .filename
+        .rsplit_once('.')
+        .map_or(job.filename.as_str(), |(stem, _)| stem);
+    job.filename = format!("{stem}.m4a");
+    Ok(true)
 }
 
 async fn upload_audio_to_telegram_cache(mut job: TelegramCacheUpload) {
@@ -2436,6 +2479,7 @@ async fn upload_or_reuse(
         Err(err) => tracing::warn!("telegram cache lookup by audio failed: {err}"),
     }
 
+    let reencoded = telegram_audio(job).await?;
     let cover = std::mem::take(&mut job.cover);
     let thumbnail = async move {
         if cover.is_empty() {
@@ -2473,7 +2517,7 @@ async fn upload_or_reuse(
     if let Err(err) = upsert_music_cache(&cache, Some(source)).await {
         tracing::warn!("failed to save music cache: {err}");
     }
-    Ok((cache, !prepared.embedded))
+    Ok((cache, !prepared.embedded && !reencoded))
 }
 
 async fn finish_telegram_upload(job: TelegramCacheUpload, result: ApiResult<(MusicCache, bool)>) {
@@ -3232,6 +3276,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Custom(_) => StatusCode::BAD_REQUEST,
             ApiError::Unplayable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::IncompleteCollection(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let retry_after = match &self {
@@ -3247,6 +3292,9 @@ impl IntoResponse for ApiError {
         let body = match &self {
             ApiError::Unplayable(message) => {
                 Json(serde_json::json!({ "detail": message, "code": UNPLAYABLE_CODE }))
+            }
+            ApiError::IncompleteCollection(message) => {
+                Json(serde_json::json!({ "detail": message, "code": INCOMPLETE_COLLECTION_CODE }))
             }
             _ => Json(serde_json::json!({ "detail": self.to_string() })),
         };
@@ -5145,6 +5193,29 @@ mod tests {
         assert!(!reason.contains("private-value"));
         assert!(!reason.contains("secret"));
         assert!(!reason.contains("example.test"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_collection_error_lets_the_client_offer_import_anyway() {
+        let response = ApiError::IncompleteCollection("缺 2 首".into()).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], INCOMPLETE_COLLECTION_CODE);
+        assert_eq!(value["detail"], "缺 2 首");
+    }
+
+    #[tokio::test]
+    async fn collection_requests_are_strict_unless_the_caller_opts_in() {
+        assert!(!music::incomplete_collection_allowed());
+        let parse = |query: &str| {
+            let uri: axum::http::Uri = format!("/x?{query}").parse().unwrap();
+            Query::<CollectionParams>::try_from_uri(&uri).unwrap().0
+        };
+        assert!(parse("platform=netease&url=x&allow_incomplete=true").allow_incomplete);
+        assert!(!parse("platform=netease&url=x").allow_incomplete);
     }
 
     #[tokio::test]
